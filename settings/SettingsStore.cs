@@ -1,0 +1,273 @@
+using System.Windows.Input;
+
+namespace TaskCopy.Data;
+
+public sealed class SettingsStore
+{
+    private const string KeyHotkeyKey = "hotkey.key";
+    private const string KeyHotkeyModifiers = "hotkey.modifiers";
+    private const string KeyStartWithWindows = "startup.enabled";
+    private const string KeyAutoPaste = "behavior.autopaste";
+    private const string KeyFirstRunComplete = "firstrun.complete";
+    private const string KeyFlyoutSortMode = "flyout.sort_mode";
+    private const string KeyRecentClipsEnabled = "recent_clips.enabled";
+    private const string KeyRecentClipsMax = "recent_clips.max";
+    private const string KeyTheme = "theme";
+    private const string KeyLastBackupAt = "backup.last_at";
+    private const string KeyFlyoutLastGroupId = "flyout.last_group_id";
+    private const string KeyFlyoutPosition = "flyout.position";
+    private const string KeyDeleteSkipConfirm = "delete.skip_confirm";
+    private const string KeyExternalEditorCommand = "editor.command";
+    private const string KeyFlyoutLastX = "flyout.last_x";
+    private const string KeyFlyoutLastY = "flyout.last_y";
+    private const string KeyStatsTotalPastes = "stats.total_pastes";
+    private const string KeyStatsTotalChars = "stats.total_chars";
+    private const string KeyMultiPasteSeparator = "multipaste.separator";
+    private const string KeyBackupEncrypted = "backup.encrypted";
+    private const string KeyBackupPwToken = "backup.pw_token";
+    private const string KeyStoreEncrypted = "store.encrypted";
+    private const string KeyStorePwToken = "store.pw_token";
+
+    private readonly SnippetDatabase _db;
+
+    public SettingsStore(SnippetDatabase db) => _db = db;
+
+    public Key HotkeyKey
+    {
+        get => Enum.TryParse<Key>(_db.GetSetting(KeyHotkeyKey), out var k) ? k : Key.V;
+        set => _db.SetSetting(KeyHotkeyKey, value.ToString());
+    }
+
+    public ModifierKeys HotkeyModifiers
+    {
+        get => Enum.TryParse<ModifierKeys>(_db.GetSetting(KeyHotkeyModifiers), out var m)
+            ? m
+            : (ModifierKeys.Control | ModifierKeys.Alt);
+        set => _db.SetSetting(KeyHotkeyModifiers, value.ToString());
+    }
+
+    public bool StartWithWindows
+    {
+        get => string.Equals(_db.GetSetting(KeyStartWithWindows), "1", StringComparison.Ordinal);
+        set => _db.SetSetting(KeyStartWithWindows, value ? "1" : "0");
+    }
+
+    public bool AutoPaste
+    {
+        // Default ON for new installs (no setting written yet); existing
+        // explicit "0" still respected.
+        get
+        {
+            var v = _db.GetSetting(KeyAutoPaste);
+            return v is null || string.Equals(v, "1", StringComparison.Ordinal);
+        }
+        set => _db.SetSetting(KeyAutoPaste, value ? "1" : "0");
+    }
+
+    public bool IsFirstRunComplete
+        => string.Equals(_db.GetSetting(KeyFirstRunComplete), "1", StringComparison.Ordinal);
+
+    public void MarkFirstRunComplete() => _db.SetSetting(KeyFirstRunComplete, "1");
+
+    public FlyoutSortMode FlyoutSortMode
+    {
+        get
+        {
+            var v = _db.GetSetting(KeyFlyoutSortMode);
+            return Enum.TryParse<FlyoutSortMode>(v, out var m) ? m : FlyoutSortMode.Manual;
+        }
+        set => _db.SetSetting(KeyFlyoutSortMode, value.ToString());
+    }
+
+    public bool RecentClipsEnabled
+    {
+        // Off by default — opt-in (privacy + name-says-snippets posture).
+        get => string.Equals(_db.GetSetting(KeyRecentClipsEnabled), "1", StringComparison.Ordinal);
+        set => _db.SetSetting(KeyRecentClipsEnabled, value ? "1" : "0");
+    }
+
+    public int RecentClipsMax
+    {
+        get
+        {
+            var v = _db.GetSetting(KeyRecentClipsMax);
+            return int.TryParse(v, out var n) ? Math.Clamp(n, 1, 500) : 50;
+        }
+        set => _db.SetSetting(KeyRecentClipsMax, Math.Clamp(value, 1, 500).ToString());
+    }
+
+    public Theme Theme
+    {
+        get
+        {
+            var v = _db.GetSetting(KeyTheme);
+            return Enum.TryParse<Theme>(v, ignoreCase: true, out var t) ? t : Theme.Mocha;
+        }
+        set => _db.SetSetting(KeyTheme, value.ToString());
+    }
+
+    /// <summary>
+    /// Unix-seconds timestamp of the last successful BackupRotator.Rotate.
+    /// Zero means "no backup yet" (or pre-throttle install).
+    /// </summary>
+    public long LastBackupAt
+    {
+        get => long.TryParse(_db.GetSetting(KeyLastBackupAt), out var v) ? v : 0L;
+        set => _db.SetSetting(KeyLastBackupAt, value.ToString());
+    }
+
+    /// <summary>
+    /// Last selected group filter in the flyout. 0 = "All", -1 = "Ungrouped",
+    /// positive = group id. Persists across flyout opens so muscle memory holds.
+    /// </summary>
+    public long FlyoutLastGroupId
+    {
+        get => long.TryParse(_db.GetSetting(KeyFlyoutLastGroupId), out var v) ? v : 0L;
+        set => _db.SetSetting(KeyFlyoutLastGroupId, value.ToString());
+    }
+
+    /// <summary>
+    /// Where the flyout opens. Cursor = default (above-and-left of pointer);
+    /// MonitorCenter = horizontally centered on the cursor's active monitor.
+    /// </summary>
+    public FlyoutPosition FlyoutPosition
+    {
+        get
+        {
+            var v = _db.GetSetting(KeyFlyoutPosition);
+            return Enum.TryParse<FlyoutPosition>(v, ignoreCase: true, out var p) ? p : FlyoutPosition.Cursor;
+        }
+        set => _db.SetSetting(KeyFlyoutPosition, value.ToString());
+    }
+
+    /// <summary>
+    /// F47: when true, skip the delete-confirm modal. Set via the
+    /// "Don't ask again" checkbox in the confirm dialog itself. Resettable
+    /// by F52 "Reset to defaults" or by deleting this row directly.
+    /// </summary>
+    public bool DeleteSkipConfirm
+    {
+        get => string.Equals(_db.GetSetting(KeyDeleteSkipConfirm), "1", StringComparison.Ordinal);
+        set => _db.SetSetting(KeyDeleteSkipConfirm, value ? "1" : "0");
+    }
+
+    /// <summary>
+    /// I40: command to spawn when the editor's "Open in external editor…"
+    /// button is clicked. Empty defaults to environment variable $EDITOR,
+    /// then `code`, then `notepad`. Example: "C:\Program Files\Microsoft VS Code\Code.exe"
+    /// or simply "code" if VS Code is on PATH.
+    /// </summary>
+    public string ExternalEditorCommand
+    {
+        get => _db.GetSetting(KeyExternalEditorCommand) ?? string.Empty;
+        set => _db.SetSetting(KeyExternalEditorCommand, value ?? string.Empty);
+    }
+
+    /// <summary>F37: lifetime count of successful auto-pastes — surfaced in About.</summary>
+    public long StatsTotalPastes
+    {
+        get => long.TryParse(_db.GetSetting(KeyStatsTotalPastes), out var v) ? v : 0L;
+        set => _db.SetSetting(KeyStatsTotalPastes, value.ToString());
+    }
+
+    /// <summary>F37: lifetime sum of expanded-body lengths — proxy for "characters typed for you."</summary>
+    public long StatsTotalChars
+    {
+        get => long.TryParse(_db.GetSetting(KeyStatsTotalChars), out var v) ? v : 0L;
+        set => _db.SetSetting(KeyStatsTotalChars, value.ToString());
+    }
+
+    /// <summary>
+    /// F32: separator used between bodies when the user multi-picks snippets
+    /// in the flyout. Default = double-newline; user can override via Settings.
+    /// </summary>
+    public string MultiPasteSeparator
+    {
+        get
+        {
+            var v = _db.GetSetting(KeyMultiPasteSeparator);
+            return v is null ? "\n\n" : v;
+        }
+        set => _db.SetSetting(KeyMultiPasteSeparator, value ?? string.Empty);
+    }
+
+    /// <summary>
+    /// F49: when true, BackupRotator.Rotate wraps each new snapshot with
+    /// AES-256-GCM before writing it to disk. The password itself is NEVER
+    /// stored — only a PBKDF2 verification token (BackupPasswordToken) lives
+    /// in this KV. Toggling off does NOT decrypt existing .bak.{N}.enc files.
+    /// </summary>
+    public bool BackupEncrypted
+    {
+        get => string.Equals(_db.GetSetting(KeyBackupEncrypted), "1", StringComparison.Ordinal);
+        set => _db.SetSetting(KeyBackupEncrypted, value ? "1" : "0");
+    }
+
+    /// <summary>F49: PBKDF2 verification token. Empty/missing = no encryption configured.</summary>
+    public string BackupPasswordToken
+    {
+        get => _db.GetSetting(KeyBackupPwToken) ?? string.Empty;
+        set => _db.SetSetting(KeyBackupPwToken, value ?? string.Empty);
+    }
+
+    /// <summary>
+    /// F30: when true, snippet titles, bodies, image payloads, edit history,
+    /// and recent clipboard bodies are AES-GCM encrypted in the SQLite store.
+    /// </summary>
+    public bool StoreEncrypted
+    {
+        get => string.Equals(_db.GetSetting(KeyStoreEncrypted), "1", StringComparison.Ordinal);
+        set => _db.SetSetting(KeyStoreEncrypted, value ? "1" : "0");
+    }
+
+    /// <summary>F30: PBKDF2/HMAC verification token for the snippet-store password.</summary>
+    public string StorePasswordToken
+    {
+        get => _db.GetSetting(KeyStorePwToken) ?? string.Empty;
+        set => _db.SetSetting(KeyStorePwToken, value ?? string.Empty);
+    }
+
+    /// <summary>
+    /// F50: last on-screen position of the flyout in WPF DIPs, used when
+    /// FlyoutPosition == LastPosition. NaN means "no position recorded yet";
+    /// the caller falls back to the Cursor placement.
+    /// </summary>
+    public (double X, double Y) FlyoutLastPosition
+    {
+        get
+        {
+            var x = double.TryParse(_db.GetSetting(KeyFlyoutLastX), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var px) ? px : double.NaN;
+            var y = double.TryParse(_db.GetSetting(KeyFlyoutLastY), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var py) ? py : double.NaN;
+            return (x, y);
+        }
+        set
+        {
+            _db.SetSetting(KeyFlyoutLastX, value.X.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+            _db.SetSetting(KeyFlyoutLastY, value.Y.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        }
+    }
+}
+
+public enum FlyoutPosition
+{
+    Cursor = 0,
+    MonitorCenter = 1,
+    /// <summary>F50: remember where the user last had it; fall back to Cursor on first open.</summary>
+    LastPosition = 2,
+}
+
+public enum Theme
+{
+    Mocha = 0,
+    Latte = 1,
+    Auto = 2,
+    /// <summary>F42: delegates every brush to SystemColors so Windows HC themes drive the look.</summary>
+    HighContrast = 3,
+}
+
+public enum FlyoutSortMode
+{
+    Manual = 0,
+    MostUsed = 1,
+    RecentlyUsed = 2,
+}

@@ -1,0 +1,619 @@
+#include "ClipboardHistory.h"
+#include "../util/Win32Util.h"
+#include <algorithm>
+#include <cctype>
+#include <cstddef>
+#include <iterator>
+#include <unordered_set>
+#include <utility>
+ClipboardHistory::ClipboardHistory(int maxItems)
+    : m_maxItems(maxItems)
+{}
+
+void ClipboardHistory::MarkChangedLocked() {
+    ++m_version;
+    if (m_changedCb) m_changedCb();
+}
+
+bool ClipboardHistory::Push(ClipboardItem item) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    const auto now = std::chrono::system_clock::now();
+    item.EnsureContentHash();
+
+    // -- Deduplication ---------------------------------------------------------
+    // For text items: if identical text already exists, move it rather than add
+    if (m_deduplicate && item.contentHash != 0) {
+        auto it = std::find_if(m_items.begin(), m_items.end(),
+            [&item](const ClipboardItem& e) {
+                return e.contentHash == item.contentHash;
+            });
+
+        if (it != m_items.end()) {
+            ClipboardItem existing = std::move(*it);
+            existing.type = item.type;
+            existing.tags = item.tags;
+            existing.text = std::move(item.text);
+            existing.imageStoreId = std::move(item.imageStoreId);
+            existing.imageW = item.imageW;
+            existing.imageH = item.imageH;
+            existing.formats = std::move(item.formats);
+            existing.sourceProcess = std::move(item.sourceProcess);
+            existing.timestamp = now;
+            existing.updatedAt = now;
+            m_items.erase(it);
+            if (m_newAtTop)
+                m_items.insert(m_items.begin(), std::move(existing));
+            else
+                m_items.push_back(std::move(existing));
+            NormalizePinnedOrderLocked();
+            MarkChangedLocked();
+            return false; // was a duplicate
+        }
+    }
+
+    // -- New item --------------------------------------------------------------
+    item.id = m_nextId++;
+    item.timestamp = now;
+    item.createdAt = now;
+    item.updatedAt = now;
+
+    if (m_newAtTop)
+        m_items.insert(m_items.begin(), std::move(item));
+    else
+        m_items.push_back(std::move(item));
+
+    NormalizePinnedOrderLocked();
+    TrimToLimit();
+    MarkChangedLocked();
+    return true;
+}
+
+bool ClipboardHistory::Insert(ClipboardItem item, size_t index) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    const auto now = std::chrono::system_clock::now();
+    item.EnsureContentHash();
+
+    if (m_deduplicate && item.contentHash != 0) {
+        auto it = std::find_if(m_items.begin(), m_items.end(),
+            [&item](const ClipboardItem& e) {
+                return e.contentHash == item.contentHash;
+            });
+        if (it != m_items.end()) {
+            item.id = it->id;
+            item.createdAt = it->createdAt;
+            item.pinned = it->pinned;
+            m_items.erase(it);
+        }
+    }
+
+    if (item.id == 0)
+        item.id = m_nextId++;
+    if (item.createdAt.time_since_epoch().count() == 0)
+        item.createdAt = now;
+    item.timestamp = now;
+    item.updatedAt = now;
+
+    index = std::min(index, m_items.size());
+    m_items.insert(m_items.begin() + static_cast<std::ptrdiff_t>(index), std::move(item));
+    NormalizePinnedOrderLocked();
+    TrimToLimit();
+    MarkChangedLocked();
+    return true;
+}
+
+size_t ClipboardHistory::Size() const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    return m_items.size();
+}
+
+size_t ClipboardHistory::PinnedSize() const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    return CountPinnedLocked();
+}
+
+const ClipboardItem* ClipboardHistory::Get(size_t index) const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (index >= m_items.size()) return nullptr;
+    return &m_items[index];
+}
+
+const ClipboardItem* ClipboardHistory::GetById(uint64_t id) const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    auto it = std::find_if(m_items.begin(), m_items.end(),
+        [id](const ClipboardItem& e) { return e.id == id; });
+    return it != m_items.end() ? &(*it) : nullptr;
+}
+
+bool ClipboardHistory::GetCopy(size_t index, ClipboardItem& out) const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (index >= m_items.size()) return false;
+    out = m_items[index];
+    return true;
+}
+
+bool ClipboardHistory::GetByIdCopy(uint64_t id, ClipboardItem& out) const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    auto it = std::find_if(m_items.begin(), m_items.end(),
+        [id](const ClipboardItem& e) { return e.id == id; });
+    if (it == m_items.end()) return false;
+    out = *it;
+    return true;
+}
+
+bool ClipboardHistory::GetPinnedCopy(size_t slot, ClipboardItem& out) const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    size_t seen = 0;
+    for (const ClipboardItem& item : m_items) {
+        if (!item.pinned)
+            continue;
+        if (seen == slot) {
+            out = item;
+            return true;
+        }
+        ++seen;
+    }
+    return false;
+}
+
+bool ClipboardHistory::GetRegularCopy(size_t slot, ClipboardItem& out) const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    size_t seen = 0;
+    for (const ClipboardItem& item : m_items) {
+        if (item.pinned)
+            continue;
+        if (seen == slot) {
+            out = item;
+            return true;
+        }
+        ++seen;
+    }
+    return false;
+}
+
+std::vector<ClipboardItem> ClipboardHistory::Snapshot() const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    return m_items;
+}
+
+void ClipboardHistory::LoadSnapshot(std::vector<ClipboardItem> items, uint64_t nextId) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_items = std::move(items);
+    m_nextId = std::max<uint64_t>(nextId, 1);
+    NormalizePinnedOrderLocked();
+    TrimToLimit();
+    ++m_version;
+}
+
+std::pair<uint64_t, uint64_t> ClipboardHistory::EstimatedMemoryBytes() const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    uint64_t total = sizeof(*this) +
+        static_cast<uint64_t>(m_items.capacity()) * sizeof(ClipboardItem);
+    uint64_t formatBytes = 0;
+    for (const ClipboardItem& item : m_items) {
+        total += item.text.capacity() + item.imageStoreId.capacity() +
+                 item.sourceFilePath.capacity() + item.sourceProcess.capacity() +
+                 item.sourceKind.capacity();
+        total += static_cast<uint64_t>(item.formats.capacity()) *
+                 sizeof(ClipboardFormatRecord);
+        for (const ClipboardFormatRecord& format : item.formats) {
+            const uint64_t payload = format.data.capacity();
+            formatBytes += payload;
+            total += payload + format.name.capacity();
+        }
+    }
+    return {total, formatBytes};
+}
+
+bool ClipboardHistory::RestoreSnapshotByStableId(
+    const std::vector<ClipboardItem>& before, uint64_t beforeNextId) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::unordered_set<uint64_t> beforeIds;
+    beforeIds.reserve(before.size());
+    for (const ClipboardItem& item : before) beforeIds.insert(item.id);
+
+    std::vector<ClipboardItem> newer;
+    newer.reserve(m_items.size());
+    for (const ClipboardItem& item : m_items) {
+        if (beforeIds.find(item.id) == beforeIds.end())
+            newer.push_back(item);
+    }
+
+    std::vector<ClipboardItem> restored;
+    restored.reserve(before.size() + newer.size());
+    for (const ClipboardItem& old : before) {
+        const auto current = std::find_if(m_items.begin(), m_items.end(),
+            [&](const ClipboardItem& item) { return item.id == old.id; });
+        restored.push_back(current != m_items.end() ? *current : old);
+    }
+    if (m_newAtTop)
+        restored.insert(restored.begin(), newer.begin(), newer.end());
+    else
+        restored.insert(restored.end(), newer.begin(), newer.end());
+
+    const bool changed = restored.size() != m_items.size() ||
+        !std::equal(restored.begin(), restored.end(), m_items.begin(), m_items.end(),
+            [](const ClipboardItem& left, const ClipboardItem& right) {
+                return left.id == right.id;
+            });
+    if (!changed) return false;
+    m_items = std::move(restored);
+    m_nextId = std::max(m_nextId, beforeNextId);
+    NormalizePinnedOrderLocked();
+    TrimToLimit();
+    MarkChangedLocked();
+    return true;
+}
+
+std::vector<size_t> ClipboardHistory::Search(const std::string& query) const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::vector<size_t> results;
+    if (query.empty()) return results;
+
+    const std::string lq = win32util::ToLower(query);
+
+    for (size_t i = 0; i < m_items.size(); ++i) {
+        if (win32util::ToLower(m_items[i].text).find(lq) != std::string::npos)
+            results.push_back(i);
+    }
+    return results;
+}
+
+void ClipboardHistory::Clear() {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_items.clear();
+    MarkChangedLocked();
+}
+
+bool ClipboardHistory::RemoveItemById(uint64_t id) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    auto it = std::find_if(m_items.begin(), m_items.end(),
+        [id](const ClipboardItem& e) { return e.id == id; });
+    if (it == m_items.end())
+        return false;
+
+    m_items.erase(it);
+    MarkChangedLocked();
+    return true;
+}
+
+bool ClipboardHistory::RemoveItemsById(const std::vector<uint64_t>& ids) {
+    if (ids.empty())
+        return false;
+
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    const std::unordered_set<uint64_t> idSet(ids.begin(), ids.end());
+    const size_t before = m_items.size();
+    m_items.erase(std::remove_if(m_items.begin(), m_items.end(),
+        [&](const ClipboardItem& item) {
+            return idSet.find(item.id) != idSet.end();
+        }), m_items.end());
+
+    if (m_items.size() == before)
+        return false;
+
+    MarkChangedLocked();
+    return true;
+}
+
+bool ClipboardHistory::MoveItem(size_t index, MoveTarget target) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (index >= m_items.size())
+        return false;
+
+    const auto now = std::chrono::system_clock::now();
+    m_items[index].lastUsedAt = now;
+    m_items[index].updatedAt = now;
+
+    if (target == MoveTarget::None)
+        return index < m_items.size();
+
+    if ((target == MoveTarget::Top && index == 0) ||
+        (target == MoveTarget::Bottom && index + 1 == m_items.size()))
+        return true;
+
+    ClipboardItem item = std::move(m_items[index]);
+    m_items.erase(m_items.begin() + static_cast<std::ptrdiff_t>(index));
+
+    if (target == MoveTarget::Top)
+        m_items.insert(m_items.begin(), std::move(item));
+    else
+        m_items.push_back(std::move(item));
+
+    NormalizePinnedOrderLocked();
+    MarkChangedLocked();
+    return true;
+}
+
+bool ClipboardHistory::MoveItemById(uint64_t id, MoveTarget target) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    auto it = std::find_if(m_items.begin(), m_items.end(),
+        [id](const ClipboardItem& e) { return e.id == id; });
+    if (it == m_items.end()) return false;
+
+    const auto now = std::chrono::system_clock::now();
+    it->lastUsedAt = now;
+    it->updatedAt = now;
+
+    if (target == MoveTarget::None) {
+        MarkChangedLocked();
+        return true;
+    }
+
+    const size_t index = static_cast<size_t>(std::distance(m_items.begin(), it));
+    if ((target == MoveTarget::Top && index == 0) ||
+        (target == MoveTarget::Bottom && index + 1 == m_items.size()))
+        return true;
+
+    ClipboardItem item = std::move(*it);
+    m_items.erase(it);
+
+    if (target == MoveTarget::Top)
+        m_items.insert(m_items.begin(), std::move(item));
+    else
+        m_items.push_back(std::move(item));
+
+    NormalizePinnedOrderLocked();
+    MarkChangedLocked();
+    return true;
+}
+
+bool ClipboardHistory::MoveItemsById(const std::vector<uint64_t>& ids,
+                                     MoveTarget target) {
+    if (ids.empty()) return false;
+    if (target == MoveTarget::Top)
+        return MoveItemsByIdToTop(ids);
+    if (target == MoveTarget::Bottom)
+        return MoveItemsByIdToBottom(ids);
+
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    const std::unordered_set<uint64_t> idSet(ids.begin(), ids.end());
+    const auto now = std::chrono::system_clock::now();
+    bool found = false;
+    for (ClipboardItem& item : m_items) {
+        if (idSet.find(item.id) == idSet.end()) continue;
+        item.lastUsedAt = now;
+        item.updatedAt = now;
+        found = true;
+    }
+    if (found)
+        MarkChangedLocked();
+    return found;
+}
+
+bool ClipboardHistory::MoveItemsByIdToTop(const std::vector<uint64_t>& ids) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (ids.empty()) return false;
+
+    std::vector<ClipboardItem> moving;
+    moving.reserve(ids.size());
+    const auto now = std::chrono::system_clock::now();
+
+    for (uint64_t id : ids) {
+        auto it = std::find_if(m_items.begin(), m_items.end(),
+            [id](const ClipboardItem& e) { return e.id == id; });
+        if (it == m_items.end()) continue;
+
+        it->lastUsedAt = now;
+        it->updatedAt = now;
+        moving.push_back(std::move(*it));
+        m_items.erase(it);
+    }
+
+    if (moving.empty()) return false;
+
+    m_items.insert(m_items.begin(),
+                   std::make_move_iterator(moving.begin()),
+                   std::make_move_iterator(moving.end()));
+    NormalizePinnedOrderLocked();
+    MarkChangedLocked();
+    return true;
+}
+
+bool ClipboardHistory::MoveItemsByIdToBottom(const std::vector<uint64_t>& ids) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (ids.empty()) return false;
+
+    std::vector<ClipboardItem> moving;
+    moving.reserve(ids.size());
+    const auto now = std::chrono::system_clock::now();
+
+    for (uint64_t id : ids) {
+        auto it = std::find_if(m_items.begin(), m_items.end(),
+            [id](const ClipboardItem& e) { return e.id == id; });
+        if (it == m_items.end()) continue;
+
+        it->lastUsedAt = now;
+        it->updatedAt = now;
+        moving.push_back(std::move(*it));
+        m_items.erase(it);
+    }
+
+    if (moving.empty()) return false;
+
+    m_items.insert(m_items.end(),
+                   std::make_move_iterator(moving.begin()),
+                   std::make_move_iterator(moving.end()));
+    NormalizePinnedOrderLocked();
+    MarkChangedLocked();
+    return true;
+}
+
+bool ClipboardHistory::MoveItemsByIdBefore(const std::vector<uint64_t>& ids, uint64_t beforeId) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (ids.empty()) return true;
+    if (std::find(ids.begin(), ids.end(), beforeId) != ids.end())
+        return true;
+
+    std::vector<ClipboardItem> moving;
+    moving.reserve(ids.size());
+
+    for (uint64_t id : ids) {
+        auto it = std::find_if(m_items.begin(), m_items.end(),
+            [id](const ClipboardItem& e) { return e.id == id; });
+        if (it == m_items.end()) continue;
+
+        moving.push_back(std::move(*it));
+        m_items.erase(it);
+    }
+
+    if (moving.empty()) return false;
+
+    auto before = std::find_if(m_items.begin(), m_items.end(),
+        [beforeId](const ClipboardItem& e) { return e.id == beforeId; });
+    auto insertAt = (before == m_items.end()) ? m_items.end() : before;
+
+    m_items.insert(insertAt,
+                   std::make_move_iterator(moving.begin()),
+                   std::make_move_iterator(moving.end()));
+    NormalizePinnedOrderLocked();
+    MarkChangedLocked();
+    return true;
+}
+
+bool ClipboardHistory::SetPinnedById(uint64_t id, bool pinned) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    auto it = std::find_if(m_items.begin(), m_items.end(),
+        [id](const ClipboardItem& e) { return e.id == id; });
+    if (it == m_items.end())
+        return false;
+
+    it->pinned = pinned;
+    it->updatedAt = std::chrono::system_clock::now();
+    NormalizePinnedOrderLocked();
+    MarkChangedLocked();
+    return true;
+}
+
+bool ClipboardHistory::SetPinnedByIdMany(const std::vector<uint64_t>& ids, bool pinned) {
+    if (ids.empty())
+        return false;
+
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    const std::unordered_set<uint64_t> idSet(ids.begin(), ids.end());
+    const auto now = std::chrono::system_clock::now();
+    bool changed = false;
+    for (ClipboardItem& item : m_items) {
+        if (idSet.find(item.id) == idSet.end())
+            continue;
+        if (item.pinned != pinned) {
+            item.pinned = pinned;
+            item.updatedAt = now;
+            changed = true;
+        }
+    }
+
+    if (!changed)
+        return false;
+
+    NormalizePinnedOrderLocked();
+    MarkChangedLocked();
+    return true;
+}
+
+bool ClipboardHistory::AddTagsByIdMany(const std::vector<uint64_t>& ids,
+                                       uint32_t tags) {
+    if (ids.empty() || tags == TAG_NONE)
+        return false;
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    bool changed = false;
+    const auto now = std::chrono::system_clock::now();
+    for (ClipboardItem& item : m_items) {
+        if (std::find(ids.begin(), ids.end(), item.id) == ids.end())
+            continue;
+        const uint32_t updated = item.tags | tags;
+        if (updated == item.tags)
+            continue;
+        item.tags = updated;
+        item.updatedAt = now;
+        changed = true;
+    }
+    if (changed)
+        MarkChangedLocked();
+    return changed;
+}
+
+bool ClipboardHistory::SetImageSourceFileByHash(uint64_t contentHash,
+                                                const std::string& sourceFilePath,
+                                                const std::string& description) {
+    if (contentHash == 0 || sourceFilePath.empty())
+        return false;
+
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    auto it = std::find_if(m_items.begin(), m_items.end(),
+        [contentHash](const ClipboardItem& e) {
+            return e.type == ContentType::Image && e.contentHash == contentHash;
+        });
+    if (it == m_items.end())
+        return false;
+
+    it->sourceKind = "screenshot";
+    it->sourceFilePath = sourceFilePath;
+    if (!description.empty())
+        it->text = description;
+    it->updatedAt = std::chrono::system_clock::now();
+    MarkChangedLocked();
+    return true;
+}
+
+void ClipboardHistory::SetMaxItems(int n) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    const size_t previousSize = m_items.size();
+    m_maxItems = (n > 0) ? n : 1;
+    TrimToLimit();
+    if (m_items.size() != previousSize)
+        MarkChangedLocked();
+}
+
+void ClipboardHistory::SetNewItemsAtTop(bool top) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_newAtTop = top;
+}
+
+void ClipboardHistory::SetOverflowCallback(OverflowCb cb) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_overflowCb = std::move(cb);
+}
+
+void ClipboardHistory::SetChangedCallback(ChangedCb cb) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_changedCb = std::move(cb);
+}
+
+void ClipboardHistory::SetDeduplicationEnabled(bool enabled) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_deduplicate = enabled;
+}
+
+uint64_t ClipboardHistory::Version() const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    return m_version;
+}
+
+size_t ClipboardHistory::CountPinnedLocked() const {
+    return static_cast<size_t>(std::count_if(m_items.begin(), m_items.end(),
+        [](const ClipboardItem& item) { return item.pinned; }));
+}
+
+void ClipboardHistory::NormalizePinnedOrderLocked() {
+    std::stable_partition(m_items.begin(), m_items.end(),
+        [](const ClipboardItem& item) { return item.pinned; });
+}
+
+// Called with lock already held
+void ClipboardHistory::TrimToLimit() {
+    while (static_cast<int>(m_items.size()) > m_maxItems) {
+        auto it = std::find_if(m_items.rbegin(), m_items.rend(),
+            [](const ClipboardItem& item) { return !item.pinned; });
+        if (it != m_items.rend()) {
+            auto eraseIt = std::next(it).base();
+            if (m_overflowCb) m_overflowCb(*eraseIt);
+            m_items.erase(eraseIt);
+            continue;
+        }
+
+        if (m_overflowCb) m_overflowCb(m_items.back());
+        m_items.pop_back();
+    }
+}
